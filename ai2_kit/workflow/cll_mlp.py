@@ -83,7 +83,8 @@ class WorkflowConfig(BaseModel):
         anyware: Optional[_anyware.AnywareConfig] = None
 
     class Select(BaseModel):
-        model_devi: selector.CllModelDeviSelectorInputConfig
+        model_devi: Optional[selector.CllModelDeviSelectorInputConfig] = None
+        llpr: Optional[selector.CllLlprSelectorInputConfig] = None
 
     class Update(BaseModel):
         walkthrough: updater.CllWalkthroughUpdaterInputConfig
@@ -304,6 +305,18 @@ async def cll_mlp_training_workflow(config: CllWorkflowConfig,
                 resource_manager=resource_manager,
             )
             selector_output = await apply_checkpoint(f'{cp_prefix}/selector-model-devi')(selector.cll_model_devi_selector)(selector_input, selector_context)
+        elif workflow_config.select.llpr:
+            selector_input = selector.CllLlprSelectorInput(
+                config=workflow_config.select.llpr,
+                model_devi_data=explore_output.get_model_devi_dataset(),
+                model_devi_file=const.MODEL_DEVI_OUT,
+                type_map=type_map,
+            )
+            selector_context = selector.CllLlprSelectorContext(
+                path_prefix=os.path.join(iter_path_prefix, 'selector-llpr'),
+                resource_manager=resource_manager,
+            )
+            selector_output = await apply_checkpoint(f'{cp_prefix}/selector-llpr')(selector.cll_llpr_selector)(selector_input, selector_context)
         else:
             raise ValueError('No select method is specified')
 

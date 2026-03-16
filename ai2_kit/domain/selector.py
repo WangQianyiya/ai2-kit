@@ -176,6 +176,46 @@ async def cll_model_devi_selector(input: CllModelDeviSelectorInput, ctx: CllMode
     )
 
 
+class CllLlprSelectorInputConfig(BaseModel):
+    """
+    Placeholder config for LLPR-based selector.
+    For now it reuses model deviation selector config internally.
+    """
+
+    model_devi: CllModelDeviSelectorInputConfig
+
+
+@dataclass
+class CllLlprSelectorInput:
+    config: CllLlprSelectorInputConfig
+    model_devi_data: List[Artifact]
+    model_devi_file: str
+    type_map: List[str]
+
+
+@dataclass
+class CllLlprSelectorContext(BaseCllContext):
+    ...
+
+
+async def cll_llpr_selector(input: CllLlprSelectorInput, ctx: CllLlprSelectorContext) -> ICllSelectorOutput:
+    """
+    LLPR selector entrypoint.
+    Currently it delegates to model deviation selector with the provided sub-config.
+    """
+    inner_input = CllModelDeviSelectorInput(
+        config=input.config.model_devi,
+        model_devi_data=input.model_devi_data,
+        model_devi_file=input.model_devi_file,
+        type_map=input.type_map,
+    )
+    inner_ctx = CllModelDevSelectorContext(
+        path_prefix=ctx.path_prefix,
+        resource_manager=ctx.resource_manager,
+    )
+    return await cll_model_devi_selector(inner_input, inner_ctx)
+
+
 def bulk_select_structures_by_model_devi(model_devi_outputs: List[ArtifactDict],
                                             model_devi_file: str,
                                             f_trust_lo: float,
