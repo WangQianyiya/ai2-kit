@@ -311,6 +311,7 @@ async def cll_mlp_training_workflow(config: CllWorkflowConfig,
                 model_devi_data=explore_output.get_model_devi_dataset(),
                 model_devi_file=const.MODEL_DEVI_OUT,
                 type_map=type_map,
+                models=train_output.get_mlp_models(),
             )
             selector_context = selector.CllLlprSelectorContext(
                 path_prefix=os.path.join(iter_path_prefix, 'selector-llpr'),

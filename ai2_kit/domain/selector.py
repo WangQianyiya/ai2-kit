@@ -3,7 +3,7 @@ from ai2_kit.core.log import get_logger
 from ai2_kit.core.util import dump_json, dump_text, flush_stdio, limit
 from ai2_kit.core.pydantic import BaseModel
 
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Literal
 from io import StringIO
 from dataclasses import dataclass
 import pandas as pd
@@ -13,6 +13,7 @@ from functools import lru_cache
 import traceback
 
 import ase.io
+import numpy as np
 import os
 
 from .data import get_data_format, DataFormat, artifacts_to_ase_atoms
@@ -178,11 +179,34 @@ async def cll_model_devi_selector(input: CllModelDeviSelectorInput, ctx: CllMode
 
 class CllLlprSelectorInputConfig(BaseModel):
     """
-    Placeholder config for LLPR-based selector.
-    For now it reuses model deviation selector config internally.
+    Config for LLPR-based selector (LLPR-DP-MACE).
+    Selects the top-n structures by LLPR uncertainty for labeling.
+    Optional SOAP/ASAP clustering can be applied on top of LLPR top-n.
     """
 
-    model_devi: CllModelDeviSelectorInputConfig
+    n_candidates: int = 100
+    """Number of structures to select (uncertainty ranked, highest first)."""
+    sigma: float = 0.01
+    """LLPR covariance regularization."""
+    train_xyz: str = ""
+    """Path to training XYZ for building LLPR covariance (required for DeepMD backend)."""
+    val_xyz: Optional[str] = None
+    """Path to validation XYZ for C calibration; if None, uses train_xyz."""
+    llpr_dp_mace_dir: Optional[str] = None
+    """Path to LLPR-DP-MACE package dir for import; if None, must be in sys.path."""
+    backend: Literal["deepmd", "mace"] = "deepmd"
+    """Backend; only 'deepmd' is implemented in this selector."""
+
+    asap_options: Optional[CllModelDeviSelectorInputConfig.AsapOptions] = None
+    """
+    Optional: after LLPR top-n selection, run SOAP/ASAP clustering to pick diverse structures
+    (one per cluster by default). If representatives are fewer than n_candidates, the rest are
+    filled from the LLPR-ordered pool by uncertainty only (no SOAP for fill-up).
+    Same interface as model_devi selector (descriptor=SOAP, dim_reducer=PCA, cluster=DBSCAN).
+    Set disable: true or omit to skip clustering.
+    """
+    workers: int = 4
+    """Number of workers for ASAP clustering when asap_options is used."""
 
 
 @dataclass
@@ -191,6 +215,8 @@ class CllLlprSelectorInput:
     model_devi_data: List[Artifact]
     model_devi_file: str
     type_map: List[str]
+    models: List[Artifact]
+    """Trained ML models (e.g. from train_output.get_mlp_models()); first is used for LLPR."""
 
 
 @dataclass
@@ -198,22 +224,293 @@ class CllLlprSelectorContext(BaseCllContext):
     ...
 
 
+def _atoms_to_coords_atype_box(atoms, type_map: List[str]):
+    """Convert ASE atoms to coords, atype (0..n_types-1), box for DeepMD."""
+    coords = atoms.get_positions().astype(np.float64)
+    symbols = atoms.get_chemical_symbols()
+    atype = np.array([type_map.index(s) for s in symbols], dtype=np.int32)
+    cell = atoms.get_cell()
+    if cell.rank == 3 and np.any(atoms.get_pbc()):
+        box = cell[:].flatten()
+    else:
+        box = np.eye(3, dtype=np.float64).flatten() * 30.0
+    return coords, atype, box
+
+
+def _run_llpr_select(
+    model_devi_outputs: List[ArtifactDict],
+    model_devi_file: str,
+    type_map: List[str],
+    work_dir: str,
+    model_path: str,
+    train_xyz: str,
+    val_xyz: Optional[str],
+    sigma: float,
+    n_candidates: int,
+    llpr_dp_mace_dir: Optional[str],
+) -> Tuple[List[ArtifactDict], List[ArtifactDict], float]:
+    """
+    Run LLPR (LLPR-DP-MACE) on explore structures and return top-n by uncertainty.
+    Designed to be run via executor.run_python_fn(); returns (candidates, new_explore_systems, passing_rate).
+    """
+    os.makedirs(work_dir, exist_ok=True)
+    val_xyz = val_xyz or train_xyz
+    if not train_xyz or not os.path.isfile(train_xyz):
+        raise FileNotFoundError(f"LLPR train_xyz must exist: {train_xyz}")
+
+    if llpr_dp_mace_dir and os.path.isdir(llpr_dp_mace_dir):
+        if llpr_dp_mace_dir not in __import__("sys").path:
+            __import__("sys").path.insert(0, llpr_dp_mace_dir)
+
+    # Collect (url, attrs, idx, atoms) for every frame from explore outputs
+    flat_list: List[Tuple[str, dict, int, "ase.Atoms"]] = []
+    for out in model_devi_outputs:
+        data_format = get_data_format(out)
+        url = out["url"]
+        attrs = dict(out.get("attrs", {}))
+        attrs.pop("model_devi_file", None)
+        if data_format in (DataFormat.LAMMPS_OUTPUT_DIR, DataFormat.LASP_LAMMPS_OUT_DIR):
+            if data_format == DataFormat.LASP_LAMMPS_OUT_DIR:
+                traj_path = os.path.join(url, "structures.xyz")
+            else:
+                traj_path = os.path.join(url, attrs.get("structures", "traj.lammpstrj"))
+            if not os.path.isfile(traj_path):
+                traj_path = os.path.join(url, "traj.lammpstrj")
+            try:
+                atoms_list = ase.io.read(traj_path, ":", format="lammps-dump-text", specorder=type_map)
+            except Exception:
+                atoms_list = ase.io.read(traj_path, ":", format="extxyz")
+            if not isinstance(atoms_list, list):
+                atoms_list = [atoms_list]
+            for idx, at in enumerate(atoms_list):
+                flat_list.append((url, dict(attrs), idx, at))
+        elif data_format == DataFormat.ANYWARE_OUTPUT_DIR:
+            structures_file = os.path.join(url, "structures.xyz")
+            atoms_list = ase.io.read(structures_file, ":", format="extxyz")
+            if not isinstance(atoms_list, list):
+                atoms_list = [atoms_list]
+            for idx, at in enumerate(atoms_list):
+                flat_list.append((url, dict(attrs), idx, at))
+        else:
+            logger.warning("Skip unsupported format %s for LLPR", data_format)
+
+    if not flat_list:
+        return [], [], 0.0
+
+    # LLPR-DP-MACE: build inv_M and C from train/val, then score our structures in memory
+    try:
+        from backend_deepmd import (
+            DeepPot,
+            build_inv_cov,
+            u_raw_score,
+            get_f_and_energy,
+            get_h_mol_per_type,
+        )
+        from data_loading import DeepMDDataLoader
+    except ImportError as e:
+        raise ImportError(
+            "LLPR selector needs LLPR-DP-MACE (backend_deepmd, data_loading): "
+            "set llpr_dp_mace_dir in config or add it to PYTHONPATH."
+        ) from e
+
+    dp = DeepPot(model_path)
+    try:
+        model_type_map = list(dp.get_type_map())
+    except Exception:
+        model_type_map = type_map
+    n_types = len(model_type_map)
+
+    loader = DeepMDDataLoader(train_xyz, val_xyz, train_xyz, 999999, 999999, 0, energy_key="U0")
+    coords_tr, atype_tr, box_tr = loader.get_train()
+    inv_M, _, _ = build_inv_cov(dp, coords_tr, box_tr, atype_tr, n_types, sigma)
+    coords_v, atype_v, box_v, energies_v = loader.get_val()
+    u_raw_list, sq_err_list = [], []
+    for coords, atype, box, e_true in zip(coords_v, atype_v, box_v, energies_v):
+        f, E_pred = get_f_and_energy(dp, coords, box, atype, n_types)
+        u_raw_list.append(u_raw_score(f, inv_M))
+        sq_err_list.append((E_pred - e_true) ** 2)
+    u_raw_val = np.array(u_raw_list)
+    sq_err_val = np.array(sq_err_list)
+    u_raw_safe = np.maximum(u_raw_val, 1e-12)
+    C = float(np.mean(sq_err_val / u_raw_safe))
+
+    # Score explore structures with workflow type_map (must match model type_map)
+    use_type_map = model_type_map if model_type_map else type_map
+    coords_list = []
+    atype_list = []
+    box_list = []
+    for _, _, _, at in flat_list:
+        c, a, b = _atoms_to_coords_atype_box(at, use_type_map)
+        coords_list.append(c)
+        atype_list.append(a)
+        box_list.append(b)
+    u_raw_test = []
+    for coords, atype, box in zip(coords_list, atype_list, box_list):
+        f = get_h_mol_per_type(dp, coords, box, atype, n_types)
+        u_raw_test.append(u_raw_score(f, inv_M))
+    u = C * np.array(u_raw_test)
+
+    # Top-n by uncertainty (descending)
+    order = np.argsort(-u)
+    n_sel = min(n_candidates, len(order))
+    top_indices = order[:n_sel]
+
+    # Build candidates: one file with top-n frames
+    candidates_xyz = os.path.join(work_dir, "llpr_candidates.xyz")
+    selected_atoms = [flat_list[i][3] for i in top_indices]
+    ase.io.write(candidates_xyz, selected_atoms, format="extxyz")
+    first_attrs = flat_list[top_indices[0]][1] if n_sel else {}
+    candidates = [
+        {"url": candidates_xyz, "format": DataFormat.EXTXYZ, "attrs": {**first_attrs, "ancestor": first_attrs.get("ancestor", "llpr")}}
+    ]
+
+    # New explore systems: one per task (url), pick frame with max variance in that task
+    url_to_indices: Dict[str, List[int]] = {}
+    for i, (url, _, _, _) in enumerate(flat_list):
+        url_to_indices.setdefault(url, []).append(i)
+    new_systems = []
+    next_dir = os.path.join(work_dir, "next")
+    os.makedirs(next_dir, exist_ok=True)
+    for url, indices in url_to_indices.items():
+        best_i = indices[np.argmax(u[indices])]
+        _, attrs, _, at = flat_list[best_i]
+        next_xyz = os.path.join(next_dir, f"next_{len(new_systems):06d}.xyz")
+        ase.io.write(next_xyz, [at], format="extxyz")
+        new_systems.append({"url": next_xyz, "format": DataFormat.EXTXYZ, "attrs": dict(attrs)})
+
+    passing_rate = n_sel / len(flat_list) if flat_list else 0.0
+    return candidates, new_systems, passing_rate
+
+
+def _fill_up_llpr_candidates(
+    work_dir: str,
+    llpr_candidates_path: str,
+    asap_candidates: List[ArtifactDict],
+    n_candidates: int,
+    type_map: List[str],
+) -> List[ArtifactDict]:
+    """
+    When ASAP is used, SOAP representatives may be fewer than n_candidates.
+    Fill up to n_candidates from the LLPR-ordered pool in file order (no SOAP for fill-up).
+    Structures already in asap_candidates are excluded; the rest are taken in llpr_candidates
+    file order (= LLPR uncertainty descending).
+    """
+    if not asap_candidates:
+        return asap_candidates
+    llpr_atoms = ase.io.read(llpr_candidates_path, ":", format="extxyz")
+    if not isinstance(llpr_atoms, list):
+        llpr_atoms = [llpr_atoms]
+    distinct_atoms = []
+    for a in asap_candidates:
+        url = a.get("url")
+        fmt = a.get("format") or DataFormat.EXTXYZ
+        if fmt == DataFormat.EXTXYZ:
+            at_list = ase.io.read(url, ":", format="extxyz")
+        else:
+            at_list = ase.io.read(url, ":", format=fmt)
+        if not isinstance(at_list, list):
+            at_list = [at_list]
+        distinct_atoms.extend(at_list)
+    if len(distinct_atoms) >= n_candidates:
+        return asap_candidates
+    need = n_candidates - len(distinct_atoms)
+    # Which indices in llpr_atoms are already in distinct (match by positions)
+    def same_struct(a, b, atol=1e-5):
+        return a.get_chemical_formula() == b.get_chemical_formula() and np.allclose(
+            a.get_positions(), b.get_positions(), atol=atol
+        )
+    selected_in_llpr = set()
+    for da in distinct_atoms:
+        for i, la in enumerate(llpr_atoms):
+            if i in selected_in_llpr:
+                continue
+            if same_struct(la, da):
+                selected_in_llpr.add(i)
+                break
+    remaining_indices = [i for i in range(len(llpr_atoms)) if i not in selected_in_llpr]
+    fill_indices = remaining_indices[:need]
+    fill_atoms = [llpr_atoms[i] for i in fill_indices]
+    final_atoms = distinct_atoms + fill_atoms
+    out_path = os.path.join(work_dir, "llpr_candidates_filled.xyz")
+    ase.io.write(out_path, final_atoms, format="extxyz")
+    attrs = dict(asap_candidates[0].get("attrs", {}))
+    return [
+        {"url": out_path, "format": DataFormat.EXTXYZ, "attrs": {**attrs, "ancestor": attrs.get("ancestor", "llpr")}}
+    ]
+
+
 async def cll_llpr_selector(input: CllLlprSelectorInput, ctx: CllLlprSelectorContext) -> ICllSelectorOutput:
     """
-    LLPR selector entrypoint.
-    Currently it delegates to model deviation selector with the provided sub-config.
+    LLPR selector: compute uncertainty via LLPR-DP-MACE and select top-n structures.
     """
-    inner_input = CllModelDeviSelectorInput(
-        config=input.config.model_devi,
-        model_devi_data=input.model_devi_data,
+    executor = ctx.resource_manager.default_executor
+    work_dir = os.path.join(executor.work_dir, ctx.path_prefix)
+    executor.mkdir(work_dir)
+
+    if not input.models:
+        raise ValueError("LLPR selector requires at least one model (train_output.get_mlp_models()).")
+    model_path = input.models[0].url
+    cfg = input.config
+    if not cfg.train_xyz:
+        raise ValueError("LLPR selector requires train_xyz in config for covariance construction.")
+
+    candidates, new_systems, passing_rate = executor.run_python_fn(_run_llpr_select)(
+        model_devi_outputs=[a.to_dict() for a in input.model_devi_data],
         model_devi_file=input.model_devi_file,
         type_map=input.type_map,
+        work_dir=work_dir,
+        model_path=model_path,
+        train_xyz=cfg.train_xyz,
+        val_xyz=cfg.val_xyz,
+        sigma=cfg.sigma,
+        n_candidates=cfg.n_candidates,
+        llpr_dp_mace_dir=cfg.llpr_dp_mace_dir,
     )
-    inner_ctx = CllModelDevSelectorContext(
-        path_prefix=ctx.path_prefix,
-        resource_manager=ctx.resource_manager,
+
+    # Optional: SOAP/ASAP clustering on LLPR top-n (same interface as model_devi)
+    if cfg.asap_options and not cfg.asap_options.disable:
+        asap = cfg.asap_options
+        candidates = executor.run_python_fn(bulk_select_distinct_structures)(
+            candidates=candidates,
+            descriptor_opt=asap.descriptor,
+            dim_reducer_opt=asap.dim_reducer,
+            cluster_opt=asap.cluster,
+            type_map=input.type_map,
+            work_dir=work_dir,
+            limit_per_cluster=asap.limit_per_cluster,
+            sort_by_energy=asap.sort_by_ssw_energy,
+            workers=input.config.workers,
+        )
+        # Fill up to n_candidates from LLPR-ordered pool by score only (no SOAP for fill-up)
+        candidates = executor.run_python_fn(_fill_up_llpr_candidates)(
+            work_dir=work_dir,
+            llpr_candidates_path=os.path.join(work_dir, "llpr_candidates.xyz"),
+            asap_candidates=candidates,
+            n_candidates=cfg.n_candidates,
+            type_map=input.type_map,
+        )
+
+    return CllLlprSelectorOutput(
+        candidates=[Artifact.of(**a) for a in candidates],
+        new_explore_systems=[Artifact.of(**a) for a in new_systems],
+        passing_rate=passing_rate,
     )
-    return await cll_model_devi_selector(inner_input, inner_ctx)
+
+
+@dataclass
+class CllLlprSelectorOutput(ICllSelectorOutput):
+    candidates: List[Artifact]
+    new_explore_systems: List[Artifact]
+    passing_rate: float
+
+    def get_model_devi_dataset(self) -> List[Artifact]:
+        return self.candidates
+
+    def get_passing_rate(self) -> float:
+        return self.passing_rate
+
+    def get_new_explore_systems(self) -> List[Artifact]:
+        return self.new_explore_systems
 
 
 def bulk_select_structures_by_model_devi(model_devi_outputs: List[ArtifactDict],
