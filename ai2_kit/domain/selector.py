@@ -3,7 +3,7 @@ from ai2_kit.core.log import get_logger
 from ai2_kit.core.util import dump_json, dump_text, flush_stdio, limit
 from ai2_kit.core.pydantic import BaseModel
 
-from typing import List, Optional, Tuple, Dict, Literal
+from typing import List, Optional, Tuple, Dict
 from io import StringIO
 from dataclasses import dataclass
 import pandas as pd
@@ -198,10 +198,6 @@ class CllLlprSelectorInputConfig(BaseModel):
     """Path to validation XYZ for C calibration. Only used when train_xyz is manually set."""
     energy_key: str = "U0"
     """Energy key in XYZ info dict. Only used when train_xyz is manually set."""
-    llpr_dp_mace_dir: Optional[str] = None
-    """Path to LLPR-DP-MACE package dir for import; if None, must be in sys.path."""
-    backend: Literal["deepmd", "mace"] = "deepmd"
-    """Backend; only 'deepmd' is implemented in this selector."""
 
     asap_options: Optional[CllModelDeviSelectorInputConfig.AsapOptions] = None
     """
@@ -292,26 +288,22 @@ def _run_llpr_select(
     type_map: List[str],
     work_dir: str,
     model_path: str,
-    train_xyz: str,
-    val_xyz: Optional[str],
     sigma: float,
     n_candidates: int,
-    llpr_dp_mace_dir: Optional[str],
     training_datasets: Optional[List[ArtifactDict]] = None,
+    train_xyz: str = "",
+    val_xyz: Optional[str] = None,
     energy_key: str = "U0",
 ) -> Tuple[List[ArtifactDict], List[ArtifactDict], float]:
     """
-    Run LLPR (LLPR-DP-MACE) on explore structures and return top-n by uncertainty.
-    Designed to be run via executor.run_python_fn(); returns (candidates, new_explore_systems, passing_rate).
+    Run LLPR on explore structures and return top-n by uncertainty.
+    Designed to be run via executor.run_python_fn().
 
-    If training_datasets is provided (and train_xyz is empty), reads training data directly
-    from DeepMD NPY dirs via dpdata, bypassing DeepMDDataLoader.
+    If training_datasets is provided (and train_xyz is empty), reads training data
+    directly from DeepMD NPY dirs via dpdata. Otherwise falls back to reading
+    train_xyz as an XYZ file via DeepMDDataLoader.
     """
     os.makedirs(work_dir, exist_ok=True)
-
-    if llpr_dp_mace_dir and os.path.isdir(llpr_dp_mace_dir):
-        if llpr_dp_mace_dir not in __import__("sys").path:
-            __import__("sys").path.insert(0, llpr_dp_mace_dir)
 
     # Collect (url, attrs, idx, atoms) for every frame from explore outputs
     flat_list: List[Tuple[str, dict, int, "ase.Atoms"]] = []
@@ -348,20 +340,8 @@ def _run_llpr_select(
     if not flat_list:
         return [], [], 0.0
 
-    # LLPR-DP-MACE: build inv_M and C, then score explore structures
-    try:
-        from backend_deepmd import (
-            DeepPot,
-            build_inv_cov,
-            u_raw_score,
-            get_f_and_energy,
-            get_h_mol_per_type,
-        )
-    except ImportError as e:
-        raise ImportError(
-            "LLPR selector needs LLPR-DP-MACE (backend_deepmd): "
-            "set llpr_dp_mace_dir in config or add it to PYTHONPATH."
-        ) from e
+    from deepmd.infer import DeepPot
+    from ai2_kit.domain.llpr import build_inv_cov, u_raw_score, get_f_and_energy, get_h_mol_per_type
 
     dp = DeepPot(model_path)
     try:
@@ -386,11 +366,21 @@ def _run_llpr_select(
         if not train_xyz or not os.path.isfile(train_xyz):
             raise FileNotFoundError(f"LLPR train_xyz must exist: {train_xyz}")
         val_xyz = val_xyz or train_xyz
-        from data_loading import DeepMDDataLoader
-        loader = DeepMDDataLoader(train_xyz, val_xyz, train_xyz, 999999, 999999, 0, energy_key=energy_key)
-        coords_tr, atype_tr, box_tr = loader.get_train()
+
+        def _load_xyz(path, ek):
+            atoms_list = ase.io.read(path, ":", format="extxyz")
+            if not isinstance(atoms_list, list):
+                atoms_list = [atoms_list]
+            cl, al, bl, el = [], [], [], []
+            for at in atoms_list:
+                c, a, b = _atoms_to_coords_atype_box(at, type_map)
+                cl.append(c); al.append(a); bl.append(b)
+                el.append(float(at.info.get(ek, at.info.get("energy", 0.0))))
+            return cl, al, bl, el
+
+        coords_tr, atype_tr, box_tr, _ = _load_xyz(train_xyz, energy_key)
         inv_M, _, _ = build_inv_cov(dp, coords_tr, box_tr, atype_tr, n_types, sigma)
-        coords_v, atype_v, box_v, energies_v = loader.get_val()
+        coords_v, atype_v, box_v, energies_v = _load_xyz(val_xyz, energy_key)
         u_raw_list, sq_err_list = [], []
         for coords, atype, box, e_true in zip(coords_v, atype_v, box_v, energies_v):
             f, E_pred = get_f_and_energy(dp, coords, box, atype, n_types)
@@ -402,7 +392,7 @@ def _run_llpr_select(
     u_raw_safe = np.maximum(u_raw_val, 1e-12)
     C = float(np.mean(sq_err_val / u_raw_safe))
 
-    # Score explore structures with workflow type_map (must match model type_map)
+    # Score explore structures
     use_type_map = model_type_map if model_type_map else type_map
     coords_list = []
     atype_list = []
@@ -531,12 +521,11 @@ async def cll_llpr_selector(input: CllLlprSelectorInput, ctx: CllLlprSelectorCon
         type_map=input.type_map,
         work_dir=work_dir,
         model_path=model_path,
-        train_xyz=cfg.train_xyz,
-        val_xyz=cfg.val_xyz,
         sigma=cfg.sigma,
         n_candidates=cfg.n_candidates,
-        llpr_dp_mace_dir=cfg.llpr_dp_mace_dir,
         training_datasets=[a.to_dict() for a in input.training_dataset] if input.training_dataset else None,
+        train_xyz=cfg.train_xyz,
+        val_xyz=cfg.val_xyz,
         energy_key=cfg.energy_key,
     )
 
