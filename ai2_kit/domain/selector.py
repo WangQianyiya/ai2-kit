@@ -189,9 +189,15 @@ class CllLlprSelectorInputConfig(BaseModel):
     sigma: float = 0.01
     """LLPR covariance regularization."""
     train_xyz: str = ""
-    """Path to training XYZ for building LLPR covariance (required for DeepMD backend)."""
+    """
+    Path to training XYZ for building LLPR covariance.
+    If empty (default), automatically uses the training dataset from the Train stage
+    (DeepMD NPY format, read via dpdata).
+    """
     val_xyz: Optional[str] = None
-    """Path to validation XYZ for C calibration; if None, uses train_xyz."""
+    """Path to validation XYZ for C calibration. Only used when train_xyz is manually set."""
+    energy_key: str = "U0"
+    """Energy key in XYZ info dict. Only used when train_xyz is manually set."""
     llpr_dp_mace_dir: Optional[str] = None
     """Path to LLPR-DP-MACE package dir for import; if None, must be in sys.path."""
     backend: Literal["deepmd", "mace"] = "deepmd"
@@ -217,6 +223,8 @@ class CllLlprSelectorInput:
     type_map: List[str]
     models: List[Artifact]
     """Trained ML models (e.g. from train_output.get_mlp_models()); first is used for LLPR."""
+    training_dataset: List[Artifact]
+    """Training dataset from Train stage; used to auto-build LLPR covariance when train_xyz is empty."""
 
 
 @dataclass
@@ -237,6 +245,47 @@ def _atoms_to_coords_atype_box(atoms, type_map: List[str]):
     return coords, atype, box
 
 
+def _load_training_data_from_deepmd_npy(
+    training_datasets: List[ArtifactDict],
+    type_map: List[str],
+) -> Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray], List[float]]:
+    """
+    Read DeepMD NPY directories (via dpdata) and return
+    (coords_list, atype_list, box_list, energies_list) for LLPR.
+    """
+    import dpdata
+    all_coords: List[np.ndarray] = []
+    all_atype: List[np.ndarray] = []
+    all_box: List[np.ndarray] = []
+    all_energies: List[float] = []
+    for ds_dict in training_datasets:
+        url = ds_dict["url"]
+        fmt = ds_dict.get("format", "")
+        if fmt == DataFormat.DEEPMD_NPY:
+            ds = dpdata.LabeledSystem(url, fmt='deepmd/npy')
+        elif fmt == DataFormat.EXTXYZ:
+            ds = dpdata.LabeledSystem(url, fmt='extxyz')
+        else:
+            logger.warning("Skip unsupported training data format %s for LLPR auto-load", fmt)
+            continue
+        if len(ds) == 0:
+            continue
+        atom_names = list(ds['atom_names'])
+        atom_types_raw = ds['atom_types']
+        symbols = [atom_names[t] for t in atom_types_raw]
+        atype = np.array([type_map.index(s) for s in symbols], dtype=np.int32)
+        for i in range(len(ds)):
+            all_coords.append(ds['coords'][i].astype(np.float64))
+            all_atype.append(atype.copy())
+            cell = ds['cells'][i]
+            if np.abs(np.linalg.det(cell)) > 1e-6:
+                all_box.append(cell.flatten().astype(np.float64))
+            else:
+                all_box.append(np.eye(3, dtype=np.float64).flatten() * 30.0)
+            all_energies.append(float(ds['energies'][i]))
+    return all_coords, all_atype, all_box, all_energies
+
+
 def _run_llpr_select(
     model_devi_outputs: List[ArtifactDict],
     model_devi_file: str,
@@ -248,15 +297,17 @@ def _run_llpr_select(
     sigma: float,
     n_candidates: int,
     llpr_dp_mace_dir: Optional[str],
+    training_datasets: Optional[List[ArtifactDict]] = None,
+    energy_key: str = "U0",
 ) -> Tuple[List[ArtifactDict], List[ArtifactDict], float]:
     """
     Run LLPR (LLPR-DP-MACE) on explore structures and return top-n by uncertainty.
     Designed to be run via executor.run_python_fn(); returns (candidates, new_explore_systems, passing_rate).
+
+    If training_datasets is provided (and train_xyz is empty), reads training data directly
+    from DeepMD NPY dirs via dpdata, bypassing DeepMDDataLoader.
     """
     os.makedirs(work_dir, exist_ok=True)
-    val_xyz = val_xyz or train_xyz
-    if not train_xyz or not os.path.isfile(train_xyz):
-        raise FileNotFoundError(f"LLPR train_xyz must exist: {train_xyz}")
 
     if llpr_dp_mace_dir and os.path.isdir(llpr_dp_mace_dir):
         if llpr_dp_mace_dir not in __import__("sys").path:
@@ -297,7 +348,7 @@ def _run_llpr_select(
     if not flat_list:
         return [], [], 0.0
 
-    # LLPR-DP-MACE: build inv_M and C from train/val, then score our structures in memory
+    # LLPR-DP-MACE: build inv_M and C, then score explore structures
     try:
         from backend_deepmd import (
             DeepPot,
@@ -306,10 +357,9 @@ def _run_llpr_select(
             get_f_and_energy,
             get_h_mol_per_type,
         )
-        from data_loading import DeepMDDataLoader
     except ImportError as e:
         raise ImportError(
-            "LLPR selector needs LLPR-DP-MACE (backend_deepmd, data_loading): "
+            "LLPR selector needs LLPR-DP-MACE (backend_deepmd): "
             "set llpr_dp_mace_dir in config or add it to PYTHONPATH."
         ) from e
 
@@ -320,15 +370,33 @@ def _run_llpr_select(
         model_type_map = type_map
     n_types = len(model_type_map)
 
-    loader = DeepMDDataLoader(train_xyz, val_xyz, train_xyz, 999999, 999999, 0, energy_key="U0")
-    coords_tr, atype_tr, box_tr = loader.get_train()
-    inv_M, _, _ = build_inv_cov(dp, coords_tr, box_tr, atype_tr, n_types, sigma)
-    coords_v, atype_v, box_v, energies_v = loader.get_val()
-    u_raw_list, sq_err_list = [], []
-    for coords, atype, box, e_true in zip(coords_v, atype_v, box_v, energies_v):
-        f, E_pred = get_f_and_energy(dp, coords, box, atype, n_types)
-        u_raw_list.append(u_raw_score(f, inv_M))
-        sq_err_list.append((E_pred - e_true) ** 2)
+    use_auto_dataset = bool(training_datasets) and not train_xyz
+    if use_auto_dataset:
+        coords_tr, atype_tr, box_tr, energies_tr = _load_training_data_from_deepmd_npy(
+            training_datasets, type_map)
+        if not coords_tr:
+            raise ValueError("No frames loaded from training_datasets for LLPR covariance.")
+        inv_M, _, _ = build_inv_cov(dp, coords_tr, box_tr, atype_tr, n_types, sigma)
+        u_raw_list, sq_err_list = [], []
+        for coords, atype, box, e_true in zip(coords_tr, atype_tr, box_tr, energies_tr):
+            f, E_pred = get_f_and_energy(dp, coords, box, atype, n_types)
+            u_raw_list.append(u_raw_score(f, inv_M))
+            sq_err_list.append((E_pred - e_true) ** 2)
+    else:
+        if not train_xyz or not os.path.isfile(train_xyz):
+            raise FileNotFoundError(f"LLPR train_xyz must exist: {train_xyz}")
+        val_xyz = val_xyz or train_xyz
+        from data_loading import DeepMDDataLoader
+        loader = DeepMDDataLoader(train_xyz, val_xyz, train_xyz, 999999, 999999, 0, energy_key=energy_key)
+        coords_tr, atype_tr, box_tr = loader.get_train()
+        inv_M, _, _ = build_inv_cov(dp, coords_tr, box_tr, atype_tr, n_types, sigma)
+        coords_v, atype_v, box_v, energies_v = loader.get_val()
+        u_raw_list, sq_err_list = [], []
+        for coords, atype, box, e_true in zip(coords_v, atype_v, box_v, energies_v):
+            f, E_pred = get_f_and_energy(dp, coords, box, atype, n_types)
+            u_raw_list.append(u_raw_score(f, inv_M))
+            sq_err_list.append((E_pred - e_true) ** 2)
+
     u_raw_val = np.array(u_raw_list)
     sq_err_val = np.array(sq_err_list)
     u_raw_safe = np.maximum(u_raw_val, 1e-12)
@@ -451,8 +519,11 @@ async def cll_llpr_selector(input: CllLlprSelectorInput, ctx: CllLlprSelectorCon
         raise ValueError("LLPR selector requires at least one model (train_output.get_mlp_models()).")
     model_path = input.models[0].url
     cfg = input.config
-    if not cfg.train_xyz:
-        raise ValueError("LLPR selector requires train_xyz in config for covariance construction.")
+    if not cfg.train_xyz and not input.training_dataset:
+        raise ValueError(
+            "LLPR selector requires either train_xyz in config or "
+            "training_dataset from the Train stage."
+        )
 
     candidates, new_systems, passing_rate = executor.run_python_fn(_run_llpr_select)(
         model_devi_outputs=[a.to_dict() for a in input.model_devi_data],
@@ -465,6 +536,8 @@ async def cll_llpr_selector(input: CllLlprSelectorInput, ctx: CllLlprSelectorCon
         sigma=cfg.sigma,
         n_candidates=cfg.n_candidates,
         llpr_dp_mace_dir=cfg.llpr_dp_mace_dir,
+        training_datasets=[a.to_dict() for a in input.training_dataset] if input.training_dataset else None,
+        energy_key=cfg.energy_key,
     )
 
     # Optional: SOAP/ASAP clustering on LLPR top-n (same interface as model_devi)
