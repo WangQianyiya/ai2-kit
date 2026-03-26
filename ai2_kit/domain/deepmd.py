@@ -6,10 +6,11 @@ from ai2_kit.core.util import dict_nested_get, expand_globs, dump_json, list_spl
 from ai2_kit.core.pydantic import BaseModel
 from ai2_kit.tool.dpdata import set_fparam, register_data_types
 
-from typing import List, Tuple, Optional
+from typing import List, Literal, Tuple, Optional
 from dataclasses import dataclass
 from itertools import groupby
 import os
+import shlex
 import sys
 import copy
 import random
@@ -127,6 +128,12 @@ class CllDeepmdInputConfig(BaseModel):
     Extra options for dp train command
     """
 
+    backend: Literal['tf', 'pt'] = 'tf'
+    """
+    DeepMD backend: 'tf' for TensorFlow, 'pt' for PyTorch.
+    PyTorch backend uses `dp --pt` commands and produces .pth model files.
+    """
+
 
 class CllDeepmdContextConfig(BaseModel):
     script_template: BashTemplate
@@ -144,6 +151,7 @@ class CllDeepmdInput:
     old_dataset: List[Artifact]  # training data used by previous iteration
     new_dataset: List[Artifact]  # training data used by current iteration
     previous: List[Artifact]  # previous models used by previous iteration
+    llpr_sigma: Optional[float] = None
 
 
 @dataclass
@@ -228,6 +236,9 @@ async def cll_deepmd(input: CllDeepmdInput, ctx: CllDeepmdContext):
         input_modifier_fn=input.config.input_modifier_fn,
     )
 
+    backend = input.config.backend
+    bs = _get_backend_settings(ctx.config.dp_cmd, backend)
+
     # run dw training job if needed
     if dw_task_dir is not None:
         logger.info(f'Run deep wannier training job, output dir: {dw_task_dir}')
@@ -237,6 +248,7 @@ async def cll_deepmd(input: CllDeepmdInput, ctx: CllDeepmdContext):
             cwd=dw_task_dir,
             pretrained_model=input.config.pretrained_model,
             dp_train_opts=input.config.dp_train_opts,
+            backend=backend,
         )
         dw_train_script = BashScript(
             template=ctx.config.script_template,
@@ -258,7 +270,7 @@ async def cll_deepmd(input: CllDeepmdInput, ctx: CllDeepmdContext):
         if input.config.init_from_previous and input.previous:
             j = i % len(input.previous)
             previous_model = os.path.join(os.path.dirname(input.previous[j].url),
-                                          DP_ORIGINAL_MODEL)
+                                          bs['original_model'])
 
         steps = _build_deepmd_steps(
             dp_cmd=ctx.config.dp_cmd,
@@ -267,7 +279,20 @@ async def cll_deepmd(input: CllDeepmdInput, ctx: CllDeepmdContext):
             pretrained_model=input.config.pretrained_model,
             previous_model=previous_model,
             dp_train_opts=input.config.dp_train_opts,
+            backend=backend,
         )
+
+        if i == 0:
+            ai2kit_pkg = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            sigma_arg = f' --sigma {input.llpr_sigma}' if input.llpr_sigma is not None else ''
+            llpr_cov_cmd = (
+                f'export PYTHONPATH={shlex.quote(ai2kit_pkg)}:$PYTHONPATH && '
+                f'"$(dirname "$(command -v dp)")/python" '
+                f'-m ai2_kit.tool.llpr_cov_from_deepmd_task '
+                f'--dp_task_dir {shlex.quote(task_dir)}{sigma_arg}'
+            )
+            steps.append(BashStep(cmd=llpr_cov_cmd, cwd=task_dir))
+
         all_steps.append(steps)
 
     # submit jobs by the number of concurrency
@@ -297,7 +322,7 @@ async def cll_deepmd(input: CllDeepmdInput, ctx: CllDeepmdContext):
     return GenericDeepmdOutput(
         dataset=input_dataset.copy(),
         models=[Artifact.of(
-            url=os.path.join(url, DP_FROZEN_MODEL),
+            url=os.path.join(url, bs['frozen_model']),
             format=DataFormat.DEEPMD_MODEL,
         ) for url in dp_task_dirs]
     )
@@ -329,33 +354,64 @@ def _classify_dataset(dataset: List[Artifact]):
     return _unique(train_systems), _unique(outlier_systems), _unique(validation_systems)
 
 
+def _get_backend_settings(dp_cmd: str, backend: str):
+    """Return backend-specific command prefix and file extensions."""
+    if backend == 'pt':
+        return {
+            'dp_base': f'{dp_cmd} --pt',
+            'ckpt_check': 'model.ckpt.pt',
+            'restart_ckpt': 'model.ckpt.pt',
+            'frozen_model': 'frozen_model.pth',
+            'original_model': 'original_model.pth',
+            'ext': '.pth',
+        }
+    return {
+        'dp_base': dp_cmd,
+        'ckpt_check': 'model.ckpt.index',
+        'restart_ckpt': 'model.ckpt',
+        'frozen_model': DP_FROZEN_MODEL,
+        'original_model': DP_ORIGINAL_MODEL,
+        'ext': '.pb',
+    }
+
+
 def _build_deepmd_steps(dp_cmd: str,
                         compress_model: bool,
                         cwd: str,
                         previous_model: Optional[str] = None,
                         pretrained_model: Optional[str] = None,
                         dp_train_opts: str = '',
+                        backend: str = 'tf',
                         ):
+    bs = _get_backend_settings(dp_cmd, backend)
+    dp_base = bs['dp_base']
     steps = []
-    dp_train_cmd = f'{dp_cmd} train {dp_train_opts} {DP_INPUT_FILE}'
+
+    dp_train_cmd = f'{dp_base} train {dp_train_opts} {DP_INPUT_FILE}'
     if previous_model:
         dp_train_cmd = f'{dp_train_cmd} -f {previous_model}'
     if pretrained_model:
         dp_train_cmd = f'{dp_train_cmd} --finetune {pretrained_model}'
 
-    dp_train_cmd_restart = f'if [ ! -f model.ckpt.index ]; then {dp_train_cmd}; else {dp_cmd} train {DP_INPUT_FILE} --restart model.ckpt; fi'
+    dp_train_cmd_restart = (
+        f'if [ ! -f {bs["ckpt_check"]} ]; then {dp_train_cmd}; '
+        f'else {dp_base} train {DP_INPUT_FILE} --restart {bs["restart_ckpt"]}; fi'
+    )
 
     steps.append(
         BashStep(cmd=dp_train_cmd_restart, cwd=cwd, checkpoint='dp-train')  # type: ignore
     )
-    if compress_model:
-        steps.append(BashStep(cmd=[dp_cmd, 'freeze', '-o', DP_ORIGINAL_MODEL, '&&',
-                                   dp_cmd, 'compress', '-i', DP_ORIGINAL_MODEL, '-o', DP_FROZEN_MODEL],
+
+    if compress_model and backend == 'pt':
+        logger.warning('Model compression is not supported for PyTorch backend, skipping.')
+
+    if compress_model and backend != 'pt':
+        steps.append(BashStep(cmd=[dp_base, 'freeze', '-o', bs['original_model'], '&&',
+                                   dp_base, 'compress', '-i', bs['original_model'], '-o', bs['frozen_model']],
                               cwd=cwd))
     else:
-        # FIXME: a temporary workaround to support previous model
-        steps.append(BashStep(cmd=[dp_cmd, 'freeze', '-o', DP_ORIGINAL_MODEL, '&&',
-                                   'cp', DP_ORIGINAL_MODEL, DP_FROZEN_MODEL],
+        steps.append(BashStep(cmd=[dp_base, 'freeze', '-o', bs['original_model'], '&&',
+                                   'cp', bs['original_model'], bs['frozen_model']],
                               cwd=cwd))
     return steps
 

@@ -13,6 +13,7 @@ from allpairspy import AllPairs
 from collections import defaultdict
 
 import os
+import shlex
 import itertools
 import random
 import ase.io
@@ -205,6 +206,7 @@ class CllLammpsInput:
     dp_models: Mapping[str, List[Artifact]]
     dp_modifier: Optional[dict]
     dp_sel_type: Optional[List[int]]
+    llpr_sigma: Optional[float] = None
 
 
 @dataclass
@@ -274,11 +276,32 @@ async def cll_lammps(input: CllLammpsInput, ctx: CllLammpsContext):
     base_cmd = f'{ctx.config.lammps_cmd} -i lammps.input'
     cmd = f'''if [ -f md.restart.* ]; then {base_cmd} -v restart 1; else {base_cmd} -v restart 0; fi'''
 
+    # prepare LLPR scoring command if sigma is set
+    llpr_scoring_cmd = None
+    if input.llpr_sigma is not None and '' in input.dp_models and input.dp_models['']:
+        model_0_url = input.dp_models[''][0].url
+        cov_path = os.path.join(os.path.dirname(model_0_url), 'llpr_cov.npy')
+        ai2kit_pkg = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        type_map_str = ','.join(input.type_map)
+        llpr_scoring_cmd = (
+            f'export PYTHONPATH={shlex.quote(ai2kit_pkg)}:$PYTHONPATH && '
+            f'"$(dirname "$(command -v dp)")/python" '
+            f'-m ai2_kit.tool.llpr_score_lammps_traj '
+            f'--model_path {shlex.quote(model_0_url)} '
+            f'--cov_path {shlex.quote(cov_path)} '
+            f'--sigma {input.llpr_sigma} '
+            f'--type_map {type_map_str}'
+        )
+
     # generate steps
     steps = []
     for task_dir in task_dirs:
+        step_cmd = cmd
+        if llpr_scoring_cmd is not None:
+            scoring = f'{llpr_scoring_cmd} --task_dir {shlex.quote(task_dir["url"])}'
+            step_cmd = f'{cmd} && ( {scoring} || true )'
         steps.append(BashStep(
-            cwd=task_dir['url'], cmd=cmd, checkpoint='lammps', exit_on_error=not input.config.ignore_error))
+            cwd=task_dir['url'], cmd=step_cmd, checkpoint='lammps', exit_on_error=not input.config.ignore_error))
 
     # submit jobs by the number of concurrency
     jobs = []

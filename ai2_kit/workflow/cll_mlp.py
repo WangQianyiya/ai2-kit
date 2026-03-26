@@ -215,6 +215,10 @@ async def cll_mlp_training_workflow(config: CllWorkflowConfig,
             break
 
         # train
+        llpr_sigma = None
+        if workflow_config.select.llpr:
+            llpr_sigma = workflow_config.select.llpr.sigma
+
         if workflow_config.train.deepmd:
             deepmd_input = deepmd.CllDeepmdInput(
                 config=workflow_config.train.deepmd,
@@ -224,6 +228,7 @@ async def cll_mlp_training_workflow(config: CllWorkflowConfig,
                 new_dataset=label_output.get_labeled_system_dataset(),
                 sel_type=shared_vars.dp_sel_type,
                 previous=[] if train_output is None else train_output.get_mlp_models(),
+                llpr_sigma=llpr_sigma,
             )
             deepmd_context = deepmd.CllDeepmdContext(
                 path_prefix=os.path.join(iter_path_prefix, 'train-deepmd'),
@@ -240,6 +245,10 @@ async def cll_mlp_training_workflow(config: CllWorkflowConfig,
         if workflow_config.general.update_explore_systems and selector_output is not None:
             new_explore_system_files = selector_output.get_new_explore_systems()
 
+        llpr_sigma = None
+        if workflow_config.select.llpr:
+            llpr_sigma = workflow_config.select.llpr.sigma
+
         if workflow_config.explore.lammps and context_config.explore.lammps:
             lammps_input = lammps.CllLammpsInput(
                 config=workflow_config.explore.lammps,
@@ -251,6 +260,7 @@ async def cll_mlp_training_workflow(config: CllWorkflowConfig,
                 new_system_files=new_explore_system_files,
                 dp_modifier=shared_vars.dp_modifier,
                 dp_sel_type=shared_vars.dp_sel_type,
+                llpr_sigma=llpr_sigma,
             )
             lammps_context = lammps.CllLammpsContext(
                 path_prefix=os.path.join(iter_path_prefix, 'explore-lammps'),

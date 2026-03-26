@@ -5,8 +5,8 @@ Computes per-structure uncertainty via the last-layer feature covariance:
     Sigma = F^T F / N
     inv_M = (Sigma + sigma^2 * I)^{-1}
     u_raw = f^T inv_M f
-    C = mean(err^2 / u_raw)   (calibrated on validation set)
-    u = C * u_raw              (calibrated uncertainty)
+    C = mean((err/N_atoms)^2 / u_raw)   (calibrated on training set)
+    sigma_e_per_atom = sqrt(C * u_raw)   (eV/atom)
 
 Requires deepmd-kit with eval_fitting_last_layer API support.
 """

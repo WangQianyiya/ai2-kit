@@ -297,21 +297,50 @@ def _run_llpr_select(
 ) -> Tuple[List[ArtifactDict], List[ArtifactDict], float]:
     """
     Run LLPR on explore structures and return top-n by uncertainty.
-    Designed to be run via executor.run_python_fn().
 
-    If training_datasets is provided (and train_xyz is empty), reads training data
-    directly from DeepMD NPY dirs via dpdata. Otherwise falls back to reading
-    train_xyz as an XYZ file via DeepMDDataLoader.
+    Fast path: if llpr.out exists in explore directories (pre-computed on MD node),
+    read scores directly without loading the model.
+    Slow path: load model + training data and compute scores in-process.
     """
     os.makedirs(work_dir, exist_ok=True)
 
     # Collect (url, attrs, idx, atoms) for every frame from explore outputs
+    # Also check for pre-computed llpr.out files
     flat_list: List[Tuple[str, dict, int, "ase.Atoms"]] = []
+    llpr_scores: Dict[str, Dict[int, float]] = {}  # url -> {step: score}
+    has_all_llpr_out = True
+
     for out in model_devi_outputs:
         data_format = get_data_format(out)
         url = out["url"]
         attrs = dict(out.get("attrs", {}))
         attrs.pop("model_devi_file", None)
+
+        # Check for pre-computed llpr.out
+        # Prefer 3rd column (sigma_e_per_atom) if present; fallback to 2nd (u_raw)
+        llpr_out_path = os.path.join(url, "llpr.out")
+        if os.path.isfile(llpr_out_path):
+            scores = {}
+            with open(llpr_out_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        try:
+                            scores[int(parts[0])] = float(parts[2])
+                        except ValueError:
+                            continue
+                    elif len(parts) >= 2:
+                        try:
+                            scores[int(parts[0])] = float(parts[1])
+                        except ValueError:
+                            continue
+            llpr_scores[url] = scores
+        else:
+            has_all_llpr_out = False
+
         if data_format in (DataFormat.LAMMPS_OUTPUT_DIR, DataFormat.LASP_LAMMPS_OUT_DIR):
             if data_format == DataFormat.LASP_LAMMPS_OUT_DIR:
                 traj_path = os.path.join(url, "structures.xyz")
@@ -325,7 +354,25 @@ def _run_llpr_select(
                 atoms_list = ase.io.read(traj_path, ":", format="extxyz")
             if not isinstance(atoms_list, list):
                 atoms_list = [atoms_list]
+
+            # Read steps from model_devi.out for matching with llpr.out
+            md_file = os.path.join(url, model_devi_file)
+            md_steps = []
+            if os.path.isfile(md_file):
+                with open(md_file) as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        parts = line.split()
+                        if parts:
+                            try:
+                                md_steps.append(int(parts[0]))
+                            except ValueError:
+                                continue
+
             for idx, at in enumerate(atoms_list):
+                at.info['_llpr_step'] = md_steps[idx] if idx < len(md_steps) else idx
                 flat_list.append((url, dict(attrs), idx, at))
         elif data_format == DataFormat.ANYWARE_OUTPUT_DIR:
             structures_file = os.path.join(url, "structures.xyz")
@@ -333,6 +380,7 @@ def _run_llpr_select(
             if not isinstance(atoms_list, list):
                 atoms_list = [atoms_list]
             for idx, at in enumerate(atoms_list):
+                at.info['_llpr_step'] = idx
                 flat_list.append((url, dict(attrs), idx, at))
         else:
             logger.warning("Skip unsupported format %s for LLPR", data_format)
@@ -340,73 +388,62 @@ def _run_llpr_select(
     if not flat_list:
         return [], [], 0.0
 
-    from deepmd.infer import DeepPot
-    from ai2_kit.domain.llpr import build_inv_cov, u_raw_score, get_f_and_energy, get_h_mol_per_type
-
-    dp = DeepPot(model_path)
-    try:
-        model_type_map = list(dp.get_type_map())
-    except Exception:
-        model_type_map = type_map
-    n_types = len(model_type_map)
-
-    use_auto_dataset = bool(training_datasets) and not train_xyz
-    if use_auto_dataset:
-        coords_tr, atype_tr, box_tr, energies_tr = _load_training_data_from_deepmd_npy(
-            training_datasets, type_map)
-        if not coords_tr:
-            raise ValueError("No frames loaded from training_datasets for LLPR covariance.")
-        inv_M, _, _ = build_inv_cov(dp, coords_tr, box_tr, atype_tr, n_types, sigma)
-        u_raw_list, sq_err_list = [], []
-        for coords, atype, box, e_true in zip(coords_tr, atype_tr, box_tr, energies_tr):
-            f, E_pred = get_f_and_energy(dp, coords, box, atype, n_types)
-            u_raw_list.append(u_raw_score(f, inv_M))
-            sq_err_list.append((E_pred - e_true) ** 2)
+    # --- Fast path: use pre-computed llpr.out scores ---
+    if has_all_llpr_out and llpr_scores:
+        logger.info("LLPR fast path: using pre-computed llpr.out scores")
+        u = np.zeros(len(flat_list))
+        for i, (url, _, _, at) in enumerate(flat_list):
+            step = at.info.get('_llpr_step', i)
+            scores = llpr_scores.get(url, {})
+            u[i] = scores.get(step, 0.0)
     else:
-        if not train_xyz or not os.path.isfile(train_xyz):
-            raise FileNotFoundError(f"LLPR train_xyz must exist: {train_xyz}")
-        val_xyz = val_xyz or train_xyz
+        # --- Slow path: compute scores in-process ---
+        logger.info("LLPR slow path: computing scores in-process")
+        from deepmd.infer import DeepPot
+        from ai2_kit.domain.llpr import build_inv_cov, u_raw_score, get_h_mol_per_type
 
-        def _load_xyz(path, ek):
-            atoms_list = ase.io.read(path, ":", format="extxyz")
-            if not isinstance(atoms_list, list):
-                atoms_list = [atoms_list]
-            cl, al, bl, el = [], [], [], []
-            for at in atoms_list:
-                c, a, b = _atoms_to_coords_atype_box(at, type_map)
-                cl.append(c); al.append(a); bl.append(b)
-                el.append(float(at.info.get(ek, at.info.get("energy", 0.0))))
-            return cl, al, bl, el
+        dp = DeepPot(model_path)
+        try:
+            model_type_map = list(dp.get_type_map())
+        except Exception:
+            model_type_map = type_map
+        n_types = len(model_type_map)
 
-        coords_tr, atype_tr, box_tr, _ = _load_xyz(train_xyz, energy_key)
-        inv_M, _, _ = build_inv_cov(dp, coords_tr, box_tr, atype_tr, n_types, sigma)
-        coords_v, atype_v, box_v, energies_v = _load_xyz(val_xyz, energy_key)
-        u_raw_list, sq_err_list = [], []
-        for coords, atype, box, e_true in zip(coords_v, atype_v, box_v, energies_v):
-            f, E_pred = get_f_and_energy(dp, coords, box, atype, n_types)
-            u_raw_list.append(u_raw_score(f, inv_M))
-            sq_err_list.append((E_pred - e_true) ** 2)
+        # Build inv_M from pre-computed llpr_cov.npy or from training data
+        cov_path = os.path.join(os.path.dirname(model_path), 'llpr_cov.npy')
+        if os.path.isfile(cov_path):
+            logger.info("Loading pre-computed covariance from %s", cov_path)
+            cov = np.load(cov_path)
+            D = cov.shape[0]
+            inv_M = np.linalg.inv(cov + (sigma ** 2) * np.eye(D, dtype=cov.dtype))
+        elif bool(training_datasets) and not train_xyz:
+            coords_tr, atype_tr, box_tr, _ = _load_training_data_from_deepmd_npy(
+                training_datasets, type_map)
+            if not coords_tr:
+                raise ValueError("No frames loaded from training_datasets for LLPR covariance.")
+            inv_M, _, _ = build_inv_cov(dp, coords_tr, box_tr, atype_tr, n_types, sigma)
+        elif train_xyz and os.path.isfile(train_xyz):
+            def _load_xyz(path, ek):
+                al = ase.io.read(path, ":", format="extxyz")
+                if not isinstance(al, list):
+                    al = [al]
+                cl, atl, bl = [], [], []
+                for at in al:
+                    c, a, b = _atoms_to_coords_atype_box(at, type_map)
+                    cl.append(c); atl.append(a); bl.append(b)
+                return cl, atl, bl
+            coords_tr, atype_tr, box_tr = _load_xyz(train_xyz, energy_key)
+            inv_M, _, _ = build_inv_cov(dp, coords_tr, box_tr, atype_tr, n_types, sigma)
+        else:
+            raise FileNotFoundError(
+                "LLPR requires llpr_cov.npy, training_datasets, or train_xyz for covariance.")
 
-    u_raw_val = np.array(u_raw_list)
-    sq_err_val = np.array(sq_err_list)
-    u_raw_safe = np.maximum(u_raw_val, 1e-12)
-    C = float(np.mean(sq_err_val / u_raw_safe))
-
-    # Score explore structures
-    use_type_map = model_type_map if model_type_map else type_map
-    coords_list = []
-    atype_list = []
-    box_list = []
-    for _, _, _, at in flat_list:
-        c, a, b = _atoms_to_coords_atype_box(at, use_type_map)
-        coords_list.append(c)
-        atype_list.append(a)
-        box_list.append(b)
-    u_raw_test = []
-    for coords, atype, box in zip(coords_list, atype_list, box_list):
-        f = get_h_mol_per_type(dp, coords, box, atype, n_types)
-        u_raw_test.append(u_raw_score(f, inv_M))
-    u = C * np.array(u_raw_test)
+        use_type_map = model_type_map if model_type_map else type_map
+        u = np.zeros(len(flat_list))
+        for i, (_, _, _, at) in enumerate(flat_list):
+            c, a, b = _atoms_to_coords_atype_box(at, use_type_map)
+            f = get_h_mol_per_type(dp, c, b, a, n_types)
+            u[i] = u_raw_score(f, inv_M)
 
     # Top-n by uncertainty (descending)
     order = np.argsort(-u)
@@ -422,7 +459,7 @@ def _run_llpr_select(
         {"url": candidates_xyz, "format": DataFormat.EXTXYZ, "attrs": {**first_attrs, "ancestor": first_attrs.get("ancestor", "llpr")}}
     ]
 
-    # New explore systems: one per task (url), pick frame with max variance in that task
+    # New explore systems: one per task (url), pick frame with max uncertainty
     url_to_indices: Dict[str, List[int]] = {}
     for i, (url, _, _, _) in enumerate(flat_list):
         url_to_indices.setdefault(url, []).append(i)

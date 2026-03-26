@@ -422,14 +422,12 @@ class QueueJobFuture(JobFuture):
             raise RuntimeError(f'Timeout of polling job: {self._job_id}')
 
     def __repr__(self):
-        return repr(dict(
-            name=self._name,
-            cwd=self._cwd,
-            job_id=self._job_id,
-            success_indicator=self._success_indicator,
-            polling_interval=self._polling_interval,
-            state=self.get_job_state(),
-        ))
+        state = self.get_job_state()
+        state_str = getattr(state, 'name', str(state))
+        return (
+            f"QueueJobFuture(name={self._name!r}, cwd={self._cwd!r}, "
+            f"job_id={self._job_id!r}, state={state_str})"
+        )
 
 
 def inject_cmd_to_script(script: str, cmd: str):
