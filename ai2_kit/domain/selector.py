@@ -179,13 +179,28 @@ async def cll_model_devi_selector(input: CllModelDeviSelectorInput, ctx: CllMode
 
 class CllLlprSelectorInputConfig(BaseModel):
     """
-    Config for LLPR-based selector (LLPR-DP-MACE).
-    Selects the top-n structures by LLPR uncertainty for labeling.
-    Optional SOAP/ASAP clustering can be applied on top of LLPR top-n.
+    Config for LLPR-based selector.
+    Classifies structures into good/decent/poor by energy uncertainty thresholds
+    (like model_devi's f_trust_lo/f_trust_hi), selects decent ones for labeling.
+    Optional SOAP/ASAP clustering can be applied on top of the decent pool.
     """
 
+    e_trust_lo: float = 0.
+    """
+    Lower bound of energy uncertainty (eV/atom) for structure selection.
+    Structures with sigma_e_per_atom < e_trust_lo are classified as 'good' (skip labeling).
+    """
+    e_trust_hi: float = 65535.
+    """
+    Upper bound of energy uncertainty (eV/atom) for structure selection.
+    Structures with sigma_e_per_atom >= e_trust_hi are classified as 'poor' (discard).
+    """
     n_candidates: int = 100
-    """Number of structures to select (uncertainty ranked, highest first)."""
+    """Max number of decent structures to select (uncertainty ranked, highest first)."""
+    new_explore_system_q: float = 0.25
+    """Quantile of uncertainty score to select the structure for next round of exploration."""
+    max_decent_per_traj: int = -1
+    """Limit the max number of decent structures per trajectory, -1 means unlimited."""
     sigma: float = 0.01
     """LLPR covariance regularization."""
     train_xyz: str = ""
@@ -201,7 +216,7 @@ class CllLlprSelectorInputConfig(BaseModel):
 
     asap_options: Optional[CllModelDeviSelectorInputConfig.AsapOptions] = None
     """
-    Optional: after LLPR top-n selection, run SOAP/ASAP clustering to pick diverse structures
+    Optional: after threshold-based selection, run SOAP/ASAP clustering to pick diverse structures
     (one per cluster by default). If representatives are fewer than n_candidates, the rest are
     filled from the LLPR-ordered pool by uncertainty only (no SOAP for fill-up).
     Same interface as model_devi selector (descriptor=SOAP, dim_reducer=PCA, cluster=DBSCAN).
@@ -290,13 +305,20 @@ def _run_llpr_select(
     model_path: str,
     sigma: float,
     n_candidates: int,
+    e_trust_lo: float = 0.,
+    e_trust_hi: float = 65535.,
+    new_explore_system_q: float = 0.25,
+    max_decent_per_traj: int = -1,
     training_datasets: Optional[List[ArtifactDict]] = None,
     train_xyz: str = "",
     val_xyz: Optional[str] = None,
     energy_key: str = "U0",
 ) -> Tuple[List[ArtifactDict], List[ArtifactDict], float]:
     """
-    Run LLPR on explore structures and return top-n by uncertainty.
+    Run LLPR on explore structures and classify by energy uncertainty thresholds.
+
+    Structures are classified as good/decent/poor (like model_devi's f_trust_lo/hi).
+    Only 'decent' structures are selected as candidates for labeling.
 
     Fast path: if llpr.out exists in explore directories (pre-computed on MD node),
     read scores directly without loading the model.
@@ -445,35 +467,98 @@ def _run_llpr_select(
             f = get_h_mol_per_type(dp, c, b, a, n_types)
             u[i] = u_raw_score(f, inv_M)
 
-    # Top-n by uncertainty (descending)
-    order = np.argsort(-u)
-    n_sel = min(n_candidates, len(order))
-    top_indices = order[:n_sel]
+    # Classify structures by energy uncertainty thresholds (like model_devi)
+    n_total = len(flat_list)
+    good_mask = u < e_trust_lo
+    decent_mask = (u >= e_trust_lo) & (u < e_trust_hi)
+    poor_mask = u >= e_trust_hi
+    n_good = int(good_mask.sum())
+    n_decent = int(decent_mask.sum())
+    n_poor = int(poor_mask.sum())
 
-    # Build candidates: one file with top-n frames
-    candidates_xyz = os.path.join(work_dir, "llpr_candidates.xyz")
-    selected_atoms = [flat_list[i][3] for i in top_indices]
-    ase.io.write(candidates_xyz, selected_atoms, format="extxyz")
-    first_attrs = flat_list[top_indices[0]][1] if n_sel else {}
-    candidates = [
-        {"url": candidates_xyz, "format": DataFormat.EXTXYZ, "attrs": {**first_attrs, "ancestor": first_attrs.get("ancestor", "llpr")}}
-    ]
+    logger.info(
+        "LLPR threshold classification: e_trust_lo=%.6f, e_trust_hi=%.6f", e_trust_lo, e_trust_hi)
 
-    # New explore systems: one per task (url), pick frame with max uncertainty
+    # Group frames by trajectory (url) for per-traj stats and max_decent_per_traj
     url_to_indices: Dict[str, List[int]] = {}
     for i, (url, _, _, _) in enumerate(flat_list):
         url_to_indices.setdefault(url, []).append(i)
-    new_systems = []
+
+    # Per-trajectory stats report (like model_devi)
+    stats_rows = []
+    for url, indices in url_to_indices.items():
+        t = len(indices)
+        g = int(good_mask[indices].sum())
+        d = int(decent_mask[indices].sum())
+        p = int(poor_mask[indices].sum())
+        short_url = f'...{url[-30:]}' if len(url) > 30 else url
+        stats_rows.append([
+            short_url, t, g, d, p,
+            f'{g / t * 100:.2f}%', f'{d / t * 100:.2f}%', f'{p / t * 100:.2f}%',
+        ])
+    headers = ['file', 'total', 'good', 'decent', 'poor', 'good%', 'decent%', 'poor%']
+    stats_report = tabulate(stats_rows, headers=headers, tablefmt='tsv')
+    logger.info('LLPR stats report:\n%s\n', stats_report)
+    try:
+        from ai2_kit.core.util import dump_text
+        dump_text(stats_report, os.path.join(work_dir, 'llpr_stats.tsv'))
+    except Exception:
+        pass
+
+    # Select decent structures, sorted by score descending, with per-traj limit
+    decent_indices_by_url: Dict[str, List[int]] = {}
+    for url, indices in url_to_indices.items():
+        traj_decent = sorted(
+            [i for i in indices if decent_mask[i]],
+            key=lambda i: -u[i],
+        )
+        if max_decent_per_traj > 0:
+            traj_decent = traj_decent[:max_decent_per_traj]
+        if traj_decent:
+            decent_indices_by_url[url] = traj_decent
+
+    all_decent_indices = []
+    for indices in decent_indices_by_url.values():
+        all_decent_indices.extend(indices)
+    all_decent_indices.sort(key=lambda i: -u[i])
+    n_sel = min(n_candidates, len(all_decent_indices))
+    top_indices = all_decent_indices[:n_sel]
+
+    logger.info(
+        "LLPR selection: total=%d, good=%d, decent=%d, poor=%d, selected=%d",
+        n_total, n_good, n_decent, n_poor, n_sel)
+
+    # Build candidates
+    candidates: List[ArtifactDict] = []
+    if top_indices:
+        candidates_xyz = os.path.join(work_dir, "llpr_candidates.xyz")
+        selected_atoms = [flat_list[i][3] for i in top_indices]
+        ase.io.write(candidates_xyz, selected_atoms, format="extxyz")
+        first_attrs = flat_list[top_indices[0]][1]
+        candidates = [
+            {"url": candidates_xyz, "format": DataFormat.EXTXYZ,
+             "attrs": {**first_attrs, "ancestor": first_attrs.get("ancestor", "llpr")}}
+        ]
+
+    # New explore systems: per trajectory, pick from good+decent (score < hi)
+    # using quantile logic like model_devi
+    new_systems: List[ArtifactDict] = []
     next_dir = os.path.join(work_dir, "next")
     os.makedirs(next_dir, exist_ok=True)
     for url, indices in url_to_indices.items():
-        best_i = indices[np.argmax(u[indices])]
-        _, attrs, _, at = flat_list[best_i]
+        not_poor = [i for i in indices if not poor_mask[i]]
+        if not not_poor:
+            not_poor = [indices[0]]
+        scores_not_poor = np.array([u[i] for i in not_poor])
+        q_val = np.quantile(scores_not_poor, new_explore_system_q)
+        eligible = [i for i, s in zip(not_poor, scores_not_poor) if s <= q_val]
+        pick = eligible[-1] if eligible else not_poor[0]
+        _, attrs, _, at = flat_list[pick]
         next_xyz = os.path.join(next_dir, f"next_{len(new_systems):06d}.xyz")
         ase.io.write(next_xyz, [at], format="extxyz")
         new_systems.append({"url": next_xyz, "format": DataFormat.EXTXYZ, "attrs": dict(attrs)})
 
-    passing_rate = n_sel / len(flat_list) if flat_list else 0.0
+    passing_rate = n_good / n_total if n_total else 0.0
     return candidates, new_systems, passing_rate
 
 
@@ -536,7 +621,7 @@ def _fill_up_llpr_candidates(
 
 async def cll_llpr_selector(input: CllLlprSelectorInput, ctx: CllLlprSelectorContext) -> ICllSelectorOutput:
     """
-    LLPR selector: compute uncertainty via LLPR-DP-MACE and select top-n structures.
+    LLPR selector: classify structures by energy uncertainty thresholds and select decent ones.
     """
     executor = ctx.resource_manager.default_executor
     work_dir = os.path.join(executor.work_dir, ctx.path_prefix)
@@ -560,6 +645,10 @@ async def cll_llpr_selector(input: CllLlprSelectorInput, ctx: CllLlprSelectorCon
         model_path=model_path,
         sigma=cfg.sigma,
         n_candidates=cfg.n_candidates,
+        e_trust_lo=cfg.e_trust_lo,
+        e_trust_hi=cfg.e_trust_hi,
+        new_explore_system_q=cfg.new_explore_system_q,
+        max_decent_per_traj=cfg.max_decent_per_traj,
         training_datasets=[a.to_dict() for a in input.training_dataset] if input.training_dataset else None,
         train_xyz=cfg.train_xyz,
         val_xyz=cfg.val_xyz,

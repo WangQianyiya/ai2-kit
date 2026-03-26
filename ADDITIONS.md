@@ -36,7 +36,16 @@
 
 ### 4.1 LLPR 选择器
 
-- **作用**：用 LLPR 对探索阶段产生的结构计算不确定性，按分数从高到低取前 `n_candidates` 个作为候选，供后续 Label 使用。
+- **作用**：用 LLPR 对探索阶段产生的结构计算能量不确定性（`sigma_e_per_atom`，eV/atom），通过上下限阈值将结构分为三类，筛选候选结构送标注。
+- **三分类**（模仿 model_devi 的 `f_trust_lo` / `f_trust_hi`）：
+  - **good**：`sigma_e_per_atom < e_trust_lo` — 模型预测良好，无需重新标注
+  - **decent**：`e_trust_lo <= sigma_e_per_atom < e_trust_hi` — 不确定性适中，选为候选送 DFT 标注
+  - **poor**：`sigma_e_per_atom >= e_trust_hi` — 偏差过大，结构可能不合理，丢弃
+- **候选选取**：从 decent 中按不确定性降序取前 `n_candidates` 个；可通过 `max_decent_per_traj` 限制每条轨迹的最大 decent 数量。
+- **next explore system**：从 good+decent（score < hi）中按 `new_explore_system_q` 分位数选取下轮探索初始结构（每条轨迹一个），逻辑与 model_devi 一致。
+- **passing_rate**：`good / total`，用于 update walkthrough 阶段判断是否推进配置表。
+- **统计报告**：每条轨迹输出 good/decent/poor 数量与比例（`llpr_stats.tsv`），格式与 model_devi 的 `stats.tsv` 一致。
+- **向后兼容**：`e_trust_lo` 默认为 0，`e_trust_hi` 默认为 65535，此时所有结构均为 decent，行为退化为原来的 top-n 模式。
 - **输入**：探索数据（`model_devi_data`）、训练好的模型（`models[0]`）、训练数据集（用于建协方差与校准，见下）、`type_map` 等。
 - **输出**：与原有 selector 一致，实现 `ICllSelectorOutput`（`get_model_devi_dataset`、`get_passing_rate`、`get_new_explore_systems`）。
 
@@ -61,7 +70,7 @@
 - **Train**：在 DeepMD 训练/冻结后，于同一 GPU 作业内对 **model0** 运行 `python -m ai2_kit.tool.llpr_cov_from_deepmd_task --sigma <sigma>`，在任务目录写出 `llpr_cov.npy` 及 `llpr_meta.json`（含标定常数 `C`）。
 - **C 标定**：使用与训练相同的数据集，按 `C = mean((err/N)^2 / u_raw)` 计算（`err = E_pred - E_DFT`，`N` = 原子数），使得 `sqrt(C * u_raw)` 的量纲为 **eV/atom**，可直接设阈值。
 - **Explore (lammps)**：LAMMPS 结束后在同一作业内运行 `llpr_score_lammps_traj`，写出 `llpr.out`。若 `llpr_meta.json` 含 `C`，则输出三列：`step`、`u_raw`、`sigma_e_per_atom`（= `sqrt(C * u_raw)`，eV/atom）。
-- **Selector 快路径**：解析 `llpr.out` 时优先使用第三列（`sigma_e_per_atom`）排序；若只有两列则回退到 `u_raw`。
+- **Selector 快路径**：解析 `llpr.out` 时优先使用第三列（`sigma_e_per_atom`）；若只有两列则回退到 `u_raw`。读取后按 `e_trust_lo` / `e_trust_hi` 将结构分为 good/decent/poor 三类，只取 decent 候选。
 - **Python 解释器**：上述两步在生成的 sbatch 中使用 `"$(dirname "$(command -v dp)")/python"`，与当前环境中 **`dp`（deepmd-kit）同目录的 Python** 一致；避免非交互 `source activate` 后裸写 `python` 仍指向 Anaconda base、导致 `ModuleNotFoundError: deepmd`。
 - **前提**：作业 `setup` 后 `dp` 须在 `PATH` 中（与运行 `dp train` / `dp freeze` 相同）。
 
@@ -69,7 +78,20 @@
 
 ## 5. 配置示例
 
-**仅 LLPR，不联用 SOAP：**
+**LLPR 带阈值筛选（推荐）：**
+
+```yaml
+select:
+  llpr:
+    e_trust_lo: 0.005          # eV/atom，低于此为 good
+    e_trust_hi: 0.05           # eV/atom，高于此为 poor
+    n_candidates: 50           # decent 最大选取数
+    new_explore_system_q: 0.25 # 下轮探索初始结构分位数
+    max_decent_per_traj: -1    # 每条轨迹 decent 上限，-1 不限
+    sigma: 0.01
+```
+
+**LLPR 不设阈值（top-n 模式，向后兼容）：**
 
 ```yaml
 select:
@@ -83,6 +105,8 @@ select:
 ```yaml
 select:
   llpr:
+    e_trust_lo: 0.005
+    e_trust_hi: 0.05
     n_candidates: 50
     sigma: 0.01
     asap_options:
